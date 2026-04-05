@@ -8,7 +8,12 @@ RUN touch src/main.rs && cargo build --release
 
 # --- Runtime stage ---
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl unzip && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=cache,id=ab-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=ab-apt-lists,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates procps hostname curl git lsof openssl unzip
 
 # Install kiro-cli (auto-detect arch, copy binary directly)
 RUN ARCH=$(dpkg --print-architecture) && \
@@ -20,11 +25,15 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod +x /usr/local/bin/kiro-cli* && \
     rm -rf /tmp/kirocli /tmp/kirocli.zip
 
-RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro
+RUN useradd -m -s /bin/bash agent
+RUN mkdir -p /home/agent/.local/share/kiro-cli /home/agent/.kiro && \
+    chown -R agent:agent /home/agent
 ENV HOME=/home/agent
 WORKDIR /home/agent
 
 COPY --from=builder /build/target/release/agent-broker /usr/local/bin/agent-broker
+
+USER agent
 
 ENTRYPOINT ["agent-broker"]
 CMD ["/etc/agent-broker/config.toml"]
