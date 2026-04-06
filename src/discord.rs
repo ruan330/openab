@@ -170,8 +170,31 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
+
+        // On startup, archive all active threads in allowed channels that were
+        // created by this bot. This prevents stale threads from creating zombie
+        // sessions (no context) after a restart.
+        let bot_id = ctx.cache.current_user().id;
+        if let Some(guild) = ready.guilds.first() {
+            match ctx.http.get_guild_active_threads(guild.id).await {
+                Ok(threads) => {
+                    for thread in threads.threads {
+                        let is_ours = thread.parent_id
+                            .map_or(false, |pid| self.allowed_channels.contains(&pid.get()));
+                        if !is_ours { continue; }
+                        let is_mine = thread.owner_id.map_or(false, |oid| oid == bot_id);
+                        if !is_mine { continue; }
+
+                        info!(thread_id = %thread.id, name = %thread.name, "archiving stale thread on startup");
+                        let edit = serenity::builder::EditThread::new().archived(true);
+                        let _ = thread.id.edit_thread(&ctx.http, edit).await;
+                    }
+                }
+                Err(e) => tracing::warn!("failed to fetch active threads: {e}"),
+            }
+        }
     }
 }
 
@@ -188,133 +211,171 @@ async fn stream_prompt(
     msg_id: MessageId,
     reactions: Arc<StatusReactionController>,
 ) -> anyhow::Result<()> {
-    let prompt = prompt.to_string();
-    let reactions = reactions.clone();
+    // Per-connection lock — does NOT hold the pool lock during streaming.
+    // Other sessions remain fully accessible. (#58)
+    let conn_arc = pool.get_connection(thread_key).await?;
+    let mut conn = conn_arc.lock().await;
 
-    pool.with_connection(thread_key, |conn| {
-        let prompt = prompt.clone();
+    let reset = conn.session_reset;
+    conn.session_reset = false;
+
+    let (mut rx, _) = conn.session_prompt(prompt).await?;
+    reactions.set_thinking().await;
+
+    let initial = if reset {
+        "⚠️ _Session expired, starting fresh..._\n\n...".to_string()
+    } else {
+        "...".to_string()
+    };
+    let (buf_tx, buf_rx) = watch::channel(initial);
+
+    let mut text_buf = String::new();
+    let mut tool_lines: Vec<String> = Vec::new();
+    let current_msg_id = msg_id;
+
+    if reset {
+        text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
+    }
+
+    // Spawn edit-streaming task
+    let edit_handle = {
         let ctx = ctx.clone();
-        let reactions = reactions.clone();
-        Box::pin(async move {
-            let reset = conn.session_reset;
-            conn.session_reset = false;
-
-            let (mut rx, _) = conn.session_prompt(&prompt).await?;
-            reactions.set_thinking().await;
-
-            let initial = if reset {
-                "⚠️ _Session expired, starting fresh..._\n\n...".to_string()
-            } else {
-                "...".to_string()
-            };
-            let (buf_tx, buf_rx) = watch::channel(initial);
-
-            let mut text_buf = String::new();
-            let mut tool_lines: Vec<String> = Vec::new();
-            let current_msg_id = msg_id;
-
-            if reset {
-                text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
-            }
-
-            // Spawn edit-streaming task
-            let edit_handle = {
-                let ctx = ctx.clone();
-                let mut buf_rx = buf_rx.clone();
-                tokio::spawn(async move {
-                    let mut last_content = String::new();
-                    let mut current_edit_msg = msg_id;
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                        if buf_rx.has_changed().unwrap_or(false) {
-                            let content = buf_rx.borrow_and_update().clone();
-                            if content != last_content {
-                                if content.len() > 1900 {
-                                    let chunks = format::split_message(&content, 1900);
-                                    if let Some(first) = chunks.first() {
-                                        let _ = edit(&ctx, channel, current_edit_msg, first).await;
-                                    }
-                                    for chunk in chunks.iter().skip(1) {
-                                        if let Ok(new_msg) = channel.say(&ctx.http, chunk).await {
-                                            current_edit_msg = new_msg.id;
-                                        }
-                                    }
-                                } else {
-                                    let _ = edit(&ctx, channel, current_edit_msg, &content).await;
-                                }
-                                last_content = content;
+        let mut buf_rx = buf_rx.clone();
+        tokio::spawn(async move {
+            let mut last_content = String::new();
+            let mut current_edit_msg = msg_id;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                if buf_rx.has_changed().unwrap_or(false) {
+                    let content = buf_rx.borrow_and_update().clone();
+                    if content != last_content {
+                        if content.len() > 1900 {
+                            let chunks = format::split_message(&content, 1900);
+                            if let Some(first) = chunks.first() {
+                                let _ = edit(&ctx, channel, current_edit_msg, first).await;
                             }
+                            for chunk in chunks.iter().skip(1) {
+                                if let Ok(new_msg) = channel.say(&ctx.http, chunk).await {
+                                    current_edit_msg = new_msg.id;
+                                }
+                            }
+                        } else {
+                            let _ = edit(&ctx, channel, current_edit_msg, &content).await;
                         }
-                        if buf_rx.has_changed().is_err() {
-                            break;
-                        }
+                        last_content = content;
                     }
-                })
-            };
-
-            // Process ACP notifications
-            let mut got_first_text = false;
-            while let Some(notification) = rx.recv().await {
-                if notification.id.is_some() {
+                }
+                if buf_rx.has_changed().is_err() {
                     break;
                 }
+            }
+        })
+    };
 
-                if let Some(event) = classify_notification(&notification) {
-                    match event {
-                        AcpEvent::Text(t) => {
-                            if !got_first_text {
-                                got_first_text = true;
-                                // Reaction: back to thinking after tools
-                            }
+    // Process ACP notifications with:
+    // - alive check: every 30s, verify agent process is running
+    // - hard timeout: 30 min safety net against infinite tool calls
+    // - drain window: after end_turn, capture late-arriving text chunks
+    let mut got_first_text = false;
+    let prompt_start = tokio::time::Instant::now();
+    let hard_timeout = std::time::Duration::from_secs(30 * 60);
+    loop {
+        let notification = tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(n) => n,
+                None => break,
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                if !conn.alive() {
+                    tracing::warn!("agent process died during prompt");
+                    break;
+                }
+                if prompt_start.elapsed() > hard_timeout {
+                    tracing::warn!("hard timeout (30 min) reached, breaking out");
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if notification.id.is_some() {
+            // Prompt response arrived. Drain remaining notifications for a
+            // short window — ACP sometimes delivers text chunks after the
+            // end_turn response due to event ordering.
+            let drain_until = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+            while let Ok(remaining) = tokio::time::timeout_at(drain_until, rx.recv()).await {
+                match remaining {
+                    Some(n) => {
+                        if let Some(AcpEvent::Text(t)) = classify_notification(&n) {
                             text_buf.push_str(&t);
                             let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
                         }
-                        AcpEvent::Thinking => {
-                            reactions.set_thinking().await;
-                        }
-                        AcpEvent::ToolStart { title, .. } if !title.is_empty() => {
-                            reactions.set_tool(&title).await;
-                            tool_lines.push(format!("🔧 `{title}`..."));
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
-                        }
-                        AcpEvent::ToolDone { title, status, .. } => {
-                            reactions.set_thinking().await;
-                            let icon = if status == "completed" { "✅" } else { "❌" };
-                            if let Some(line) = tool_lines.iter_mut().rev().find(|l| l.contains(&title)) {
-                                *line = format!("{icon} `{title}`");
-                            }
-                            let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
-                        }
-                        _ => {}
                     }
+                    None => break,
                 }
             }
+            break;
+        }
 
-            conn.prompt_done().await;
-            drop(buf_tx);
-            let _ = edit_handle.await;
-
-            // Final edit
-            let final_content = compose_display(&tool_lines, &text_buf);
-            let final_content = if final_content.is_empty() {
-                "_(no response)_".to_string()
-            } else {
-                final_content
-            };
-
-            let chunks = format::split_message(&final_content, 2000);
-            for (i, chunk) in chunks.iter().enumerate() {
-                if i == 0 {
-                    let _ = edit(&ctx, channel, current_msg_id, chunk).await;
-                } else {
-                    let _ = channel.say(&ctx.http, chunk).await;
+        if let Some(event) = classify_notification(&notification) {
+            match event {
+                AcpEvent::Text(t) => {
+                    if !got_first_text {
+                        got_first_text = true;
+                    }
+                    text_buf.push_str(&t);
+                    let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
                 }
+                AcpEvent::Thinking => {
+                    reactions.set_thinking().await;
+                }
+                AcpEvent::ToolStart { title, .. } if !title.is_empty() => {
+                    reactions.set_tool(&title).await;
+                    tool_lines.push(format!("🔧 `{title}`..."));
+                    let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                }
+                AcpEvent::ToolDone { title, status, .. } => {
+                    reactions.set_thinking().await;
+                    let icon = if status == "completed" { "✅" } else { "❌" };
+                    if let Some(line) = tool_lines.iter_mut().rev().find(|l| l.contains(&title)) {
+                        *line = format!("{icon} `{title}`");
+                    }
+                    let _ = buf_tx.send(compose_display(&tool_lines, &text_buf));
+                }
+                _ => {}
             }
+        }
+    }
 
-            Ok(())
-        })
-    })
-    .await
+    conn.prompt_done().await;
+    drop(conn); // release per-connection lock immediately
+    drop(buf_tx);
+    let _ = edit_handle.await;
+
+    // Final edit — fallback to tool summary if text_buf is empty
+    let final_content = compose_display(&tool_lines, &text_buf);
+    let final_content = if final_content.trim().is_empty() {
+        if !tool_lines.is_empty() {
+            let mut fallback = tool_lines.join("\n");
+            fallback.push_str("\n\n_Task completed but no text response was captured._");
+            fallback
+        } else {
+            "_(no response)_".to_string()
+        }
+    } else {
+        final_content
+    };
+
+    let chunks = format::split_message(&final_content, 2000);
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i == 0 {
+            let _ = edit(&ctx, channel, current_msg_id, chunk).await;
+        } else {
+            let _ = channel.say(&ctx.http, chunk).await;
+        }
+    }
+
+    Ok(())
 }
 
 fn compose_display(tool_lines: &[String], text: &str) -> String {
