@@ -1,3 +1,7 @@
+> **This is a production-hardened fork of [openabdev/openab](https://github.com/openabdev/openab).**
+> We run this 24/7 with multiple concurrent bots. All changes are intended for upstream contribution.
+> See [FORK.md](FORK.md) for what we added and why.
+
 # OpenAB — Open Agent Broker
 
 A lightweight, secure, cloud-native ACP harness that bridges Discord and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, etc.) over stdio JSON-RPC — delivering the next-generation development experience.
