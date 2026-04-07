@@ -23,9 +23,14 @@
 
 | Remote | URL | 用途 |
 |--------|-----|------|
-| `origin` | `ruan330/agent-broker` (private) | 我們的版本 |
-| `upstream` | `openabdev/openab` (public) | 上游（已 rename） |
-| `fork` | `ruan330/agent-broker-1` (public fork) | 提 PR 用 |
+| `origin` | `ruan330/agent-broker` (private) | 日常開發、部署 |
+| `upstream` | `openabdev/openab` (public) | 上游更新 |
+| `fork` | `ruan330/openab` (public) | 公開 fork、提 PR 用 |
+
+### 工作流
+- Private `origin`：自由 commit，含部署設定
+- Public `fork`：checkout `fork-main` branch → squash merge main → push。零 secrets
+- 提 PR：從 `fork` 的 feature branch 對 upstream 開
 
 ## 我們的修改（vs 上游）
 
@@ -68,6 +73,7 @@ curl -s http://localhost:8091/status   # 幕府行令
 
 ## 注意事項
 
-- config.toml 和 config-docker.toml 含 Discord Bot token，**不可 open source**
-- 上游已 rename 為 openabdev/openab，但我們的 remote 名稱還是 upstream
-- 上游有 sender identity injection（feat/issue-61），下次 pull 需處理衝突
+- config.toml 和 config-docker.toml 含 Discord Bot token，已 gitignore，**不可推到 public fork**
+- Binary 已 rename：`target/release/openab`（不再是 `agent-broker`）
+- 上游 sender identity injection 已整合
+- Public fork 的 CI workflows（Build & Release、Release Charts）已禁用

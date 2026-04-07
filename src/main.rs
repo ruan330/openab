@@ -27,6 +27,20 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 
     let cfg = config::load_config(&config_path)?;
+
+    // Kill orphan agent processes and stale broker instances from previous runs.
+    // kill_on_drop doesn't fire when the broker is killed with SIGKILL.
+    let agent_bin = cfg.agent.command.rsplit('/').next().unwrap_or(&cfg.agent.command);
+    let _ = std::process::Command::new("pkill").arg("-f").arg(agent_bin).status();
+    // Kill stale broker processes (e.g. old binary name after rename), excluding ourselves
+    let my_pid = std::process::id().to_string();
+    for old_name in &["agent-broker", "openab"] {
+        let _ = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("pgrep -f '{old_name}' | grep -v {} | xargs kill 2>/dev/null", my_pid))
+            .status();
+    }
+
     info!(
         agent_cmd = %cfg.agent.command,
         pool_max = cfg.pool.max_sessions,
