@@ -20,12 +20,93 @@ fn expand_env(val: &str) -> String {
 }
 use tokio::time::Instant;
 
+// --- Shared handle for writing to a connection without holding its mutex ---
+
+/// A permission request forwarded from the reader loop for interactive handling.
+pub struct PermissionRequest {
+    pub rpc_id: u64,
+    pub plan_text: Option<String>,
+}
+
+/// Lightweight handle for writing to a connection's stdin without holding the
+/// full AcpConnection mutex. Used for steer (prompt queueing) and interactive
+/// permission replies.
+#[derive(Clone)]
+pub struct SharedHandle {
+    stdin: Arc<Mutex<ChildStdin>>,
+    next_id: Arc<AtomicU64>,
+    session_id: String,
+}
+
+impl SharedHandle {
+    async fn send_raw(&self, data: &str) -> Result<()> {
+        debug!(data = data.trim(), "shared_send");
+        let mut w = self.stdin.lock().await;
+        w.write_all(data.as_bytes()).await?;
+        w.write_all(b"\n").await?;
+        w.flush().await?;
+        Ok(())
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Send a JSON-RPC response (for permission replies).
+    pub async fn send_response(&self, id: u64, result: Value) -> Result<()> {
+        let resp = JsonRpcResponse::new(id, result);
+        let data = serde_json::to_string(&resp)?;
+        self.send_raw(&data).await
+    }
+
+    /// Send a session/prompt request (for steer / prompt queueing).
+    pub async fn send_prompt(&self, prompt: &str) -> Result<()> {
+        let id = self.next_id();
+        let req = JsonRpcRequest::new(
+            id,
+            "session/prompt",
+            Some(json!({
+                "sessionId": self.session_id,
+                "prompt": [{"type": "text", "text": prompt}],
+            })),
+        );
+        let data = serde_json::to_string(&req)?;
+        self.send_raw(&data).await
+    }
+}
+
+// --- Pending interactive permissions registry ---
+
+pub struct PendingPermission {
+    pub rpc_id: u64,
+    pub plan_text: String,
+    pub shared_handle: SharedHandle,
+}
+
+#[derive(Default)]
+pub struct PendingPermissions {
+    inner: Mutex<HashMap<String, PendingPermission>>,
+}
+
+impl PendingPermissions {
+    pub async fn insert(&self, thread_id: String, perm: PendingPermission) {
+        self.inner.lock().await.insert(thread_id, perm);
+    }
+
+    pub async fn take(&self, thread_id: &str) -> Option<PendingPermission> {
+        self.inner.lock().await.remove(thread_id)
+    }
+}
+
+// --- ACP Connection ---
+
 pub struct AcpConnection {
     _proc: Child,
     stdin: Arc<Mutex<ChildStdin>>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    permission_tx: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionRequest>>>>,
     pub acp_session_id: Option<String>,
     pub last_active: Instant,
     pub session_reset: bool,
@@ -63,10 +144,13 @@ impl AcpConnection {
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
+        let permission_tx: Arc<Mutex<Option<mpsc::UnboundedSender<PermissionRequest>>>> =
+            Arc::new(Mutex::new(None));
 
         let reader_handle = {
             let pending = pending.clone();
             let notify_tx = notify_tx.clone();
+            let permission_tx = permission_tx.clone();
             let stdin_clone = stdin.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout);
@@ -87,7 +171,7 @@ impl AcpConnection {
                     };
                     debug!(line = line.trim(), "acp_recv");
 
-                    // Auto-reply session/request_permission
+                    // Handle session/request_permission
                     if msg.method.as_deref() == Some("session/request_permission") {
                         if let Some(id) = msg.id {
                             let title = msg.params.as_ref()
@@ -95,8 +179,54 @@ impl AcpConnection {
                                 .and_then(|t| t.get("title"))
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("?");
-                            info!(title, "auto-allow permission");
-                            let reply = JsonRpcResponse::new(id, json!({"optionId": "allow_always"}));
+
+                            // Detect ExitPlanMode: options contain "bypassPermissions"
+                            let is_plan_exit = msg.params.as_ref()
+                                .and_then(|p| p.get("options"))
+                                .and_then(|o| o.as_array())
+                                .map(|opts| opts.iter().any(|o|
+                                    o.get("optionId").and_then(|id| id.as_str()) == Some("plan")
+                                ))
+                                .unwrap_or(false);
+
+                            // For ExitPlanMode, try to forward to interactive handler
+                            if is_plan_exit {
+                                let ptx = permission_tx.lock().await;
+                                if let Some(tx) = ptx.as_ref() {
+                                    let plan_text = msg.params.as_ref()
+                                        .and_then(|p| p.get("toolCall"))
+                                        .and_then(|t| t.get("rawInput"))
+                                        .and_then(|r| r.get("plan"))
+                                        .and_then(|p| p.as_str())
+                                        .map(|s| s.to_string());
+                                    let _ = tx.send(PermissionRequest {
+                                        rpc_id: id,
+                                        plan_text,
+                                    });
+                                    info!(title, "forwarding ExitPlanMode to interactive handler");
+                                    continue; // Do NOT auto-reply
+                                }
+                                // No interactive handler — fall through to auto-reply
+                            }
+
+                            // Auto-reply: pick most permissive option
+                            let option_id = msg.params.as_ref()
+                                .and_then(|p| p.get("options"))
+                                .and_then(|o| o.as_array())
+                                .and_then(|options| {
+                                    options.iter()
+                                        .find(|o| o.get("kind").and_then(|k| k.as_str()) == Some("allow_always"))
+                                        .or_else(|| options.iter()
+                                            .find(|o| o.get("kind").and_then(|k| k.as_str()) == Some("allow_once")))
+                                        .or_else(|| options.iter()
+                                            .find(|o| o.get("kind").and_then(|k| k.as_str()) != Some("reject_once")))
+                                        .and_then(|o| o.get("optionId"))
+                                        .and_then(|id| id.as_str())
+                                })
+                                .unwrap_or("allow_always");
+
+                            info!(title, option_id, "auto-allow permission");
+                            let reply = JsonRpcResponse::new(id, json!({"optionId": option_id}));
                             if let Ok(data) = serde_json::to_string(&reply) {
                                 let mut w = stdin_clone.lock().await;
                                 let _ = w.write_all(format!("{data}\n").as_bytes()).await;
@@ -110,10 +240,8 @@ impl AcpConnection {
                     if let Some(id) = msg.id {
                         let mut map = pending.lock().await;
                         if let Some(tx) = map.remove(&id) {
-                            // Forward to subscriber so they see the completion
                             let sub = notify_tx.lock().await;
                             if let Some(ntx) = sub.as_ref() {
-                                // Clone the essential fields for the subscriber
                                 let _ = ntx.send(JsonRpcMessage {
                                     id: Some(id),
                                     method: None,
@@ -134,7 +262,7 @@ impl AcpConnection {
                     }
                 }
 
-                // Connection closed — resolve all pending with error
+                // Connection closed
                 let mut map = pending.lock().await;
                 for (_, tx) in map.drain() {
                     let _ = tx.send(JsonRpcMessage {
@@ -148,7 +276,6 @@ impl AcpConnection {
                         params: None,
                     });
                 }
-                // Signal subscriber
                 let sub = notify_tx.lock().await;
                 drop(sub);
             })
@@ -157,13 +284,22 @@ impl AcpConnection {
         Ok(Self {
             _proc: proc,
             stdin,
-            next_id: AtomicU64::new(1),
+            next_id: Arc::new(AtomicU64::new(1)),
             pending,
             notify_tx,
+            permission_tx,
             acp_session_id: None,
             last_active: Instant::now(),
             session_reset: false,
             _reader_handle: reader_handle,
+        })
+    }
+
+    pub fn shared_handle(&self) -> Option<SharedHandle> {
+        self.acp_session_id.as_ref().map(|sid| SharedHandle {
+            stdin: self.stdin.clone(),
+            next_id: self.next_id.clone(),
+            session_id: sid.clone(),
         })
     }
 
@@ -242,12 +378,15 @@ impl AcpConnection {
         Ok(session_id)
     }
 
-    /// Send a prompt and return a receiver for streaming notifications.
-    /// The final message on the channel will have id set (the prompt response).
+    /// Send a prompt and return receivers for notifications and permission requests.
     pub async fn session_prompt(
         &mut self,
         prompt: &str,
-    ) -> Result<(mpsc::UnboundedReceiver<JsonRpcMessage>, u64)> {
+    ) -> Result<(
+        mpsc::UnboundedReceiver<JsonRpcMessage>,
+        mpsc::UnboundedReceiver<PermissionRequest>,
+        u64,
+    )> {
         self.last_active = Instant::now();
 
         let session_id = self
@@ -257,6 +396,9 @@ impl AcpConnection {
 
         let (tx, rx) = mpsc::unbounded_channel();
         *self.notify_tx.lock().await = Some(tx);
+
+        let (perm_tx, perm_rx) = mpsc::unbounded_channel();
+        *self.permission_tx.lock().await = Some(perm_tx);
 
         let id = self.next_id();
         let req = JsonRpcRequest::new(
@@ -273,12 +415,12 @@ impl AcpConnection {
         self.pending.lock().await.insert(id, resp_tx);
 
         self.send_raw(&data).await?;
-        Ok((rx, id))
+        Ok((rx, perm_rx, id))
     }
 
-    /// Call after prompt streaming is done to clean up subscriber.
     pub async fn prompt_done(&mut self) {
         *self.notify_tx.lock().await = None;
+        *self.permission_tx.lock().await = None;
         self.last_active = Instant::now();
     }
 

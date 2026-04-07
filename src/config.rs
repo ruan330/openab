@@ -11,6 +11,8 @@ pub struct Config {
     pub pool: PoolConfig,
     #[serde(default)]
     pub reactions: ReactionsConfig,
+    #[serde(default)]
+    pub gates: GatesConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -18,9 +20,12 @@ pub struct DiscordConfig {
     pub bot_token: String,
     #[serde(default)]
     pub allowed_channels: Vec<String>,
+    /// Bot user IDs allowed to trigger this broker (bypasses the bot-message filter)
+    #[serde(default)]
+    pub allowed_bots: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct AgentConfig {
     pub command: String,
     #[serde(default)]
@@ -82,6 +87,68 @@ pub struct ReactionTiming {
     #[serde(default = "default_error_hold_ms")]
     pub error_hold_ms: u64,
 }
+
+// --- gates ---
+
+#[derive(Debug, Deserialize)]
+pub struct GatesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub pipeline: Vec<GateEntry>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GateEntry {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub gate_type: GateType,
+    #[serde(default = "default_trigger")]
+    pub trigger: GateTrigger,
+    #[serde(default)]
+    pub action: GateAction,
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub prompt_file: Option<String>,
+    #[serde(default = "default_max_rounds")]
+    pub max_rounds: u32,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GateType {
+    Builtin,
+    Agent,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GateTrigger {
+    OnResponse,
+    OnComplete,
+    OnFileChange,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum GateAction {
+    Block,
+    Redact,
+}
+
+impl Default for GatesConfig {
+    fn default() -> Self {
+        Self { enabled: false, pipeline: vec![] }
+    }
+}
+
+impl Default for GateAction {
+    fn default() -> Self { Self::Block }
+}
+
+fn default_trigger() -> GateTrigger { GateTrigger::OnComplete }
+fn default_max_rounds() -> u32 { 3 }
 
 // --- defaults ---
 

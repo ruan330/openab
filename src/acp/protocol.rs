@@ -60,8 +60,8 @@ impl std::fmt::Display for JsonRpcError {
 pub enum AcpEvent {
     Text(String),
     Thinking,
-    ToolStart { title: String },
-    ToolDone { title: String, status: String },
+    ToolStart { id: String, title: String },
+    ToolDone { id: String, title: String, status: String },
     Status,
 }
 
@@ -78,17 +78,27 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
         "agent_thought_chunk" => {
             Some(AcpEvent::Thinking)
         }
-        "tool_call" => {
-            let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Some(AcpEvent::ToolStart { title })
-        }
-        "tool_call_update" => {
+        "tool_call" | "tool_call_update" => {
+            // Skip sub-tool events (internal to Agent subagents) — they have
+            // parentToolUseId set and produce empty-title ToolDone noise.
+            let is_subtool = update.get("_meta")
+                .and_then(|m| m.get("claudeCode"))
+                .and_then(|c| c.get("parentToolUseId"))
+                .and_then(|p| p.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if is_subtool { return None; }
+
+            let id = update.get("toolCallId").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
             if status == "completed" || status == "failed" {
-                Some(AcpEvent::ToolDone { title, status })
+                Some(AcpEvent::ToolDone { id, title, status })
+            } else if !title.is_empty() {
+                Some(AcpEvent::ToolStart { id, title })
             } else {
-                Some(AcpEvent::ToolStart { title })
+                None // intermediate update with empty title — skip
             }
         }
         "plan" => Some(AcpEvent::Status),

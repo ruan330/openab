@@ -1,0 +1,49 @@
+# OpenAB (agent-broker) — Example Configuration
+#
+# Copy to config.toml and fill in your values.
+# config.toml is gitignored and will not be committed.
+
+[discord]
+bot_token = "YOUR_DISCORD_BOT_TOKEN"
+allowed_channels = ["CHANNEL_ID"]      # Discord channel IDs (as strings)
+allowed_bots = []                       # Bot user IDs allowed to trigger this broker
+
+[agent]
+command = "claude-agent-acp"
+args = []
+working_dir = "/path/to/your/projects"
+# env = { IS_SANDBOX = "1" }           # Uncomment for sandboxed environments
+
+[pool]
+max_sessions = 10
+session_ttl_hours = 168                 # 7 days
+
+[gates]
+enabled = false
+
+[[gates.pipeline]]
+name = "secret-scan"
+type = "builtin"
+trigger = "on_complete"
+action = "redact"
+patterns = ["sk-[a-zA-Z0-9]{20,}", "ghp_[a-zA-Z0-9]{36}", "AKIA[A-Z0-9]{16}"]
+
+[reactions]
+enabled = true
+remove_after_reply = false
+
+[reactions.emojis]
+queued = "👀"
+thinking = "🤔"
+tool = "🔥"
+coding = "👨‍💻"
+web = "⚡"
+done = "🆗"
+error = "😱"
+
+[reactions.timing]
+debounce_ms = 700
+stall_soft_ms = 10000
+stall_hard_ms = 30000
+done_hold_ms = 1500
+error_hold_ms = 2500

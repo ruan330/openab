@@ -1,4 +1,5 @@
 /target
 config.toml
+config-docker.toml
 *.swp
 .DS_Store

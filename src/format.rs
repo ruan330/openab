@@ -18,11 +18,15 @@ pub fn split_message(text: &str, limit: usize) -> Vec<String> {
         }
         // If a single line exceeds limit, hard-split it
         if line.len() > limit {
-            for chunk in line.as_bytes().chunks(limit) {
+            let mut remaining = line;
+            while !remaining.is_empty() {
+                let end = remaining.floor_char_boundary(limit.min(remaining.len()));
+                let end = if end == 0 { remaining.len().min(limit.max(1)) } else { end };
                 if !current.is_empty() {
                     chunks.push(current);
                 }
-                current = String::from_utf8_lossy(chunk).to_string();
+                current = remaining[..end].to_string();
+                remaining = &remaining[end..];
             }
         } else {
             current.push_str(line);
