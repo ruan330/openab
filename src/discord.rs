@@ -74,7 +74,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let prompt = if is_mentioned {
+        let mut prompt = if is_mentioned {
             strip_mention(&msg.content)
         } else {
             msg.content.trim().to_string()
@@ -83,35 +83,28 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Check for pending interactive permission (e.g. ExitPlanMode)
+        // Check for pending plan (ExitPlanMode was auto-approved, user is responding)
         let thread_key_check = if in_thread {
             msg.channel_id.get().to_string()
         } else {
             String::new()
         };
         if in_thread {
-            if let Some(pending) = self.pending_permissions.take(&thread_key_check).await {
+            if let Some(_pending) = self.pending_permissions.take(&thread_key_check).await {
                 let execute_keywords = ["執行", "execute", "go", "yes", "y", "好", "開始"];
                 let is_execute = execute_keywords.iter().any(|kw|
                     prompt.to_lowercase().trim() == *kw
                 );
 
                 if is_execute {
-                    let _ = pending.shared_handle.send_response(
-                        pending.rpc_id,
-                        serde_json::json!({"optionId": "bypassPermissions"}),
-                    ).await;
                     let _ = msg.channel_id.say(&ctx.http, "▶️ 開始執行").await;
+                    prompt = "The user approved your plan. Start implementing it now. \
+                              Do not re-enter plan mode.".to_string();
                 } else {
-                    // Keep planning — send "plan" and steer with user's feedback
-                    let _ = pending.shared_handle.send_response(
-                        pending.rpc_id,
-                        serde_json::json!({"optionId": "plan"}),
-                    ).await;
-                    let _ = pending.shared_handle.send_prompt(&prompt).await;
                     let _ = msg.channel_id.say(&ctx.http, "📝 繼續規劃...").await;
+                    // prompt stays as user's feedback
                 }
-                return;
+                // Fall through to normal stream_prompt flow
             }
         }
 
@@ -207,6 +200,7 @@ impl EventHandler for Handler {
         let mut current_msg = thinking_msg;
         let mut rounds = 0u32;
         let mut final_ok = false;
+        let mut auth_retried = false;
 
         loop {
             rounds += 1;
@@ -283,6 +277,22 @@ impl EventHandler for Handler {
                         break;
                     }
                 }
+                Err(e) if e.to_string().contains("__auth_retry__") && !auth_retried => {
+                    auth_retried = true;
+                    // Auth failed → token refreshed → kill stale session → retry once
+                    tracing::info!(thread_key, "auth retry: killing stale session");
+                    self.pool.kill_session(&thread_key).await;
+                    if let Err(e2) = self.pool.get_or_create(&thread_key, None).await {
+                        let _ = edit(&ctx, thread_channel, current_msg.id, &format!("⚠️ {e2}")).await;
+                        break;
+                    }
+                    let _ = edit(&ctx, thread_channel, current_msg.id, "🔄 _Reconnecting..._").await;
+                    current_msg = match thread_channel.say(&ctx.http, "...").await {
+                        Ok(m) => m,
+                        Err(e2) => { error!("failed to post: {e2}"); break; }
+                    };
+                    continue; // retry the prompt
+                }
                 Err(e) => {
                     let _ = edit(&ctx, thread_channel, current_msg.id, &format!("⚠️ {e}")).await;
                     break;
@@ -290,13 +300,20 @@ impl EventHandler for Handler {
             }
         }
 
-        if final_ok {
+        // If a plan was proposed during stream_prompt, the PendingPermission is
+        // already stored and the plan already displayed. Don't set_done with an
+        // error state — the plan turn completed successfully.
+        let has_pending_plan = self.pending_permissions.contains(&thread_key).await;
+
+        if has_pending_plan {
+            reactions.set_done().await;
+        } else if final_ok {
             reactions.set_done().await;
         } else {
             reactions.set_error().await;
         }
 
-        let hold_ms = if final_ok {
+        let hold_ms = if final_ok || has_pending_plan {
             self.reactions_config.timing.done_hold_ms
         } else {
             self.reactions_config.timing.error_hold_ms
@@ -398,33 +415,7 @@ async fn stream_prompt(
     }
 
     // Spawn edit-streaming task
-    let edit_handle = {
-        let ctx = ctx.clone();
-        let mut buf_rx = buf_rx.clone();
-        tokio::spawn(async move {
-            let mut last_content = String::new();
-            let current_edit_msg = msg_id;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                if buf_rx.has_changed().unwrap_or(false) {
-                    let content = buf_rx.borrow_and_update().clone();
-                    if content != last_content {
-                        let display = if content.len() > 1900 {
-                            let boundary = content.floor_char_boundary(1900);
-                            format!("{}…", &content[..boundary])
-                        } else {
-                            content.clone()
-                        };
-                        let _ = edit(&ctx, channel, current_edit_msg, &display).await;
-                        last_content = content;
-                    }
-                }
-                if buf_rx.has_changed().is_err() {
-                    break;
-                }
-            }
-        })
-    };
+    let edit_handle = spawn_edit_task(ctx, channel, msg_id, buf_rx.clone());
 
     // Process ACP notifications.
     // Periodically check if the agent process is still alive, and enforce a
@@ -440,7 +431,8 @@ async fn stream_prompt(
             },
             perm = perm_rx.recv() => {
                 if let Some(pr) = perm {
-                    // ExitPlanMode: show plan in Discord, wait for user decision
+                    // ExitPlanMode: show plan, auto-approve, let turn end naturally.
+                    // The message handler will pick up the user's response as a new prompt.
                     if let Some(ref plan) = pr.plan_text {
                         let plan_msg = format!("📋 **Plan**\n\n{plan}\n\n_回覆「執行」開始執行，或回覆修改意見繼續規劃。_");
                         let chunks = format::split_message(&plan_msg, 2000);
@@ -448,16 +440,20 @@ async fn stream_prompt(
                             let _ = channel.say(&ctx.http, chunk).await;
                         }
                     }
+                    // Auto-approve ExitPlanMode
                     if let Some(ref handle) = shared_handle {
+                        let _ = handle.send_response(
+                            pr.rpc_id,
+                            serde_json::json!({"optionId": "bypassPermissions"}),
+                        ).await;
+                    }
+                    // Store plan so message handler knows a plan was proposed
+                    {
                         use crate::acp::connection::PendingPermission;
                         pending_permissions.insert(thread_key.to_string(), PendingPermission {
-                            rpc_id: pr.rpc_id,
                             plan_text: pr.plan_text.unwrap_or_default(),
-                            shared_handle: handle.clone(),
                         }).await;
                     }
-                    // Don't change reaction here — let the normal
-                    // thinking/done flow handle it after plan mode completes.
                 }
                 continue;
             },
@@ -475,6 +471,18 @@ async fn stream_prompt(
         };
 
         if notification.id.is_some() {
+            // Check for auth errors — trigger token refresh for retry
+            if let Some(ref err) = notification.error {
+                if err.message.contains("401") || err.message.contains("authentication") {
+                    tracing::warn!("auth error detected, refreshing OAuth token");
+                    crate::acp::connection::refresh_oauth_if_needed().await;
+                    conn.prompt_done().await;
+                    drop(conn);
+                    drop(buf_tx);
+                    let _ = edit_handle.await;
+                    return Err(anyhow::anyhow!("__auth_retry__"));
+                }
+            }
             // Prompt response arrived. Drain any remaining notifications
             // for a short window — message chunks sometimes arrive after
             // the response due to ACP event ordering.
@@ -575,6 +583,38 @@ fn compose_display(tool_lines: &[String], text: &str) -> String {
     }
     out.push_str(text.trim_end());
     out
+}
+
+fn spawn_edit_task(
+    ctx: &Context,
+    channel: ChannelId,
+    msg_id: MessageId,
+    buf_rx: watch::Receiver<String>,
+) -> tokio::task::JoinHandle<()> {
+    let ctx = ctx.clone();
+    let mut buf_rx = buf_rx;
+    tokio::spawn(async move {
+        let mut last_content = String::new();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            if buf_rx.has_changed().unwrap_or(false) {
+                let content = buf_rx.borrow_and_update().clone();
+                if content != last_content {
+                    let display = if content.len() > 1900 {
+                        let boundary = content.floor_char_boundary(1900);
+                        format!("{}…", &content[..boundary])
+                    } else {
+                        content.clone()
+                    };
+                    let _ = edit(&ctx, channel, msg_id, &display).await;
+                    last_content = content;
+                }
+            }
+            if buf_rx.has_changed().is_err() {
+                break;
+            }
+        }
+    })
 }
 
 fn strip_mention(content: &str) -> String {

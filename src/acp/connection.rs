@@ -20,6 +20,145 @@ fn expand_env(val: &str) -> String {
 }
 use tokio::time::Instant;
 
+/// Refresh Claude OAuth token if expired. Checks the credentials file,
+/// tries macOS Keychain first (CC CLI stores refreshed tokens there),
+/// then falls back to HTTP refresh using the refresh token.
+pub async fn refresh_oauth_if_needed() {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let creds_path = format!("{home}/.claude/.credentials.json");
+    let content = match tokio::fs::read_to_string(&creds_path).await {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let creds: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let oauth = match creds.get("claudeAiOauth") {
+        Some(o) => o,
+        None => return,
+    };
+    let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    if expires_at > now_ms + 60_000 {
+        return; // token still valid (with 60s buffer)
+    }
+
+    info!("OAuth token in credentials file expired, attempting refresh...");
+
+    // Strategy 1: macOS Keychain (CC CLI stores refreshed tokens here)
+    if try_refresh_from_keychain(&creds_path).await {
+        return;
+    }
+
+    // Strategy 2: HTTP refresh using refresh_token from the file
+    let refresh_token = match oauth.get("refreshToken").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => { error!("no refresh token available"); return; }
+    };
+    try_refresh_via_http(&creds_path, &refresh_token, now_ms).await;
+}
+
+/// Try to read a fresh token from macOS Keychain ("Claude Code-credentials")
+/// and write it to the credentials file.
+async fn try_refresh_from_keychain(creds_path: &str) -> bool {
+    let output = match tokio::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    let keychain_json = match String::from_utf8(output.stdout) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return false,
+    };
+    let keychain_creds: Value = match serde_json::from_str(&keychain_json) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    // Check if the keychain token is actually fresh
+    let kc_expires = keychain_creds
+        .get("claudeAiOauth")
+        .and_then(|o| o.get("expiresAt"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    if kc_expires <= now_ms + 60_000 {
+        debug!("keychain token also expired, skipping");
+        return false;
+    }
+    match tokio::fs::write(creds_path, serde_json::to_string_pretty(&keychain_creds).unwrap()).await {
+        Ok(_) => { info!("OAuth token refreshed from macOS Keychain"); true }
+        Err(e) => { error!("failed to write keychain credentials: {e}"); false }
+    }
+}
+
+/// Refresh OAuth token via HTTP using the refresh_token grant.
+async fn try_refresh_via_http(creds_path: &str, refresh_token: &str, now_ms: i64) {
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => { error!("failed to build HTTP client: {e}"); return; }
+    };
+    let resp = client
+        .post("https://platform.claude.com/v1/oauth/token")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
+        ])
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => { error!("OAuth refresh request failed: {e}"); return; }
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        error!(%status, body, "OAuth HTTP refresh failed");
+        return;
+    }
+    let body: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => { error!("OAuth refresh parse error: {e}"); return; }
+    };
+    if let Some(access_token) = body.get("access_token").and_then(|v| v.as_str()) {
+        let mut creds: Value = match tokio::fs::read_to_string(creds_path).await
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(v) => v,
+            None => return,
+        };
+        let oauth_mut = creds.get_mut("claudeAiOauth").unwrap();
+        oauth_mut["accessToken"] = Value::String(access_token.to_string());
+        if let Some(rt) = body.get("refresh_token").and_then(|v| v.as_str()) {
+            oauth_mut["refreshToken"] = Value::String(rt.to_string());
+        }
+        if let Some(expires_in) = body.get("expires_in").and_then(|v| v.as_i64()) {
+            oauth_mut["expiresAt"] = Value::Number((now_ms + expires_in * 1000).into());
+        }
+        match tokio::fs::write(creds_path, serde_json::to_string_pretty(&creds).unwrap()).await {
+            Ok(_) => info!("OAuth token refreshed via HTTP and saved"),
+            Err(e) => error!("failed to write refreshed credentials: {e}"),
+        }
+    } else {
+        error!(body = %body, "OAuth HTTP refresh missing access_token");
+    }
+}
+
 // --- Shared handle for writing to a connection without holding its mutex ---
 
 /// A permission request forwarded from the reader loop for interactive handling.
@@ -78,9 +217,7 @@ impl SharedHandle {
 // --- Pending interactive permissions registry ---
 
 pub struct PendingPermission {
-    pub rpc_id: u64,
     pub plan_text: String,
-    pub shared_handle: SharedHandle,
 }
 
 #[derive(Default)]
@@ -95,6 +232,10 @@ impl PendingPermissions {
 
     pub async fn take(&self, thread_id: &str) -> Option<PendingPermission> {
         self.inner.lock().await.remove(thread_id)
+    }
+
+    pub async fn contains(&self, thread_id: &str) -> bool {
+        self.inner.lock().await.contains_key(thread_id)
     }
 }
 
@@ -120,6 +261,10 @@ impl AcpConnection {
         working_dir: &str,
         env: &std::collections::HashMap<String, String>,
     ) -> Result<Self> {
+        // Refresh OAuth token before spawning agent (handles Docker/container
+        // environments where the CC CLI can't use macOS Keychain for refresh).
+        refresh_oauth_if_needed().await;
+
         info!(cmd = command, ?args, cwd = working_dir, "spawning agent");
 
         let mut cmd = tokio::process::Command::new(command);

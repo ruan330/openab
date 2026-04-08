@@ -37,9 +37,9 @@
 | 檔案 | 修改 |
 |------|------|
 | `pool.rs` | `Arc<Mutex<AcpConnection>>` per-connection lock、per-thread CWD、SharedHandle、session status/kill |
-| `connection.rs` | SharedHandle、PermissionRequest、PendingPermissions、interactive ExitPlanMode、auto-allow 從 options 選合法 optionId |
+| `connection.rs` | SharedHandle、PermissionRequest、PendingPermissions、ExitPlanMode auto-approve、auto-allow 從 options 選合法 optionId、OAuth token refresh（Keychain + HTTP）|
 | `protocol.rs` | toolCallId extraction、跳過 sub-tool 事件（parentToolUseId） |
-| `discord.rs` | `[cwd:]`/`[name:]` directives、toolCallId matching、streaming truncation、alive check + hard timeout、drain window + fallback、啟動自動封存舊 thread、gate pipeline loop、steer (try_lock + SharedHandle)、interactive plan mode (perm_rx) |
+| `discord.rs` | `[cwd:]`/`[name:]` directives、toolCallId matching、streaming truncation、alive check + hard timeout、drain window + fallback、啟動自動封存舊 thread、gate pipeline loop、steer (try_lock + SharedHandle)、plan mode（CC App 模型：auto-approve + plan review loop）、401 auth retry、spawn_edit_task |
 | `config.rs` | `allowed_bots`、`GatesConfig` |
 | `main.rs` | HTTP management API (:8090)、gate pipeline init、allowed_bots、PendingPermissions |
 | `src/gates/` | 整個 output gate pipeline module（builtin + agent） |
