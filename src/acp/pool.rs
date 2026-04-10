@@ -95,6 +95,12 @@ impl SessionPool {
         }
     }
 
+    /// Return the thread IDs of all currently tracked sessions.
+    /// Used by the shutdown path to broadcast notifications before the pool is cleared.
+    pub async fn active_thread_ids(&self) -> Vec<String> {
+        self.connections.read().await.keys().cloned().collect()
+    }
+
     pub async fn shutdown(&self) {
         let mut conns = self.connections.write().await;
         let count = conns.len();

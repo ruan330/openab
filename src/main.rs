@@ -68,9 +68,37 @@ async fn main() -> anyhow::Result<()> {
     // Run bot until SIGINT/SIGTERM
     let shard_manager = client.shard_manager.clone();
     let shutdown_pool = pool.clone();
+    let broadcast_pool = pool.clone();
+    let shutdown_http = client.http.clone();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
         info!("shutdown signal received");
+
+        // Broadcast shutdown notification to active threads before closing the pool.
+        // Neutral wording — we don't promise automatic resume; Phase 2 of RFC #78 1d
+        // (session persistence) is a separate follow-up.
+        let thread_ids = broadcast_pool.active_thread_ids().await;
+        info!(count = thread_ids.len(), "broadcasting shutdown notification");
+        for thread_id in thread_ids {
+            if let Ok(id) = thread_id.parse::<u64>() {
+                let channel = serenity::model::id::ChannelId::new(id);
+                if let Err(e) = channel
+                    .say(
+                        &shutdown_http,
+                        "🔄 Broker restarting. You can continue the conversation when the broker is back.",
+                    )
+                    .await
+                {
+                    tracing::warn!(thread_id, error = %e, "failed to post shutdown notification");
+                }
+            }
+        }
+
         shard_manager.shutdown_all().await;
     });
 
