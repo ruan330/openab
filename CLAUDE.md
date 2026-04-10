@@ -17,6 +17,7 @@
 | 修了 Bug | wiki 領域頁（Bug 經驗庫段落） |
 | 發現 edge case | wiki 領域頁 + code 中加 WHY NOT 註釋 |
 | 做了決策或否決方案 | `decisions.md` |
+| Public fork sync（squash merge 到 fork-main） | `wiki/log.md`（記 squash commit + 主要內容類別） |
 | 以上任何更新 | `wiki/log.md`（append 一條） |
 
 ## 專案結構

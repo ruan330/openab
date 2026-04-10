@@ -29,8 +29,16 @@ main branch               fork-main branch           main branch
 1. 在 private `origin` 開發完成
 2. Checkout `fork-main` branch
 3. Squash merge main（確保歷史乾淨、零 secrets）
-4. Push 到 `fork`
+4. Push 到 `fork`（用 `--force-with-lease`）
 5. 從 `fork` 開 feature branch 對 `upstream` 提 PR
+6. 在 `wiki/log.md` 記一條 sync 紀錄（squash commit hash + 主要類別）
+
+**⚠️ Diverged history 陷阱（2026-04-10 踩雷）：**
+`fork-main` 和 `main` 相對 merge base 有各自的變更時，`git merge --squash -X theirs main` **不會**覆蓋掉 fork-main 獨有的 one-sided additions（例如 fork-main 之前 squash 進來、後來在 origin 被移除的程式碼）。`-X theirs` 只在 conflict 出現時才偏向 `main`，對非 conflict 的單邊加法沒效。
+
+**正確做法：** 先 `git reset --hard fork/main` 清乾淨，然後 `git checkout origin/main -- src/ Cargo.toml Cargo.lock CLAUDE.md docs/` 明確覆蓋工作樹。這會把 origin/main 當前狀態完整拷過去，避開 3-way merge 的舊 delta 記憶。
+
+**為什麼不能 reset fork-main 到 origin/main：** fork-main 是線性 squash 歷史（一次 sync 一個 commit），reset 會炸掉歷史記錄，對 public 觀察者造成 force push 震盪。squash merge 才是對的語義。
 
 ### PR / Issue 追蹤（截至 2026-04-10）
 
