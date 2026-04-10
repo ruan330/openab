@@ -2,14 +2,22 @@
 
 我們的 fork，基於 https://github.com/openabdev/openab（原 thepagent/agent-broker）。
 
-## 架構文件
+## 文件系統
 
-所有架構、變更記錄、待辦追蹤在 Obsidian Vault：
-- **架構總覽**：`/Users/ruandan/Documents/claude_code/Obsidian-Vault/05_Resources/揚洲幕府/Architecture.md`
-- **需求追蹤**：`/Users/ruandan/Documents/claude_code/Obsidian-Vault/05_Resources/揚洲幕府/Backlog.md`
-- **變更記錄**：`/Users/ruandan/Documents/claude_code/Obsidian-Vault/05_Resources/揚洲幕府/Changelog.md`
+- 領域知識見 `docs/wiki/index.md`（按需查閱，不要一次全讀）
+- 否決方案與決策記錄見 `docs/decisions.md`
+- 實作新功能前，先查 wiki 對應領域頁
+- 文件與 code 同一個 commit 提交
 
-**啟動前務必先讀上述三份文件**，了解完整的架構、已知問題、和待辦事項。
+## 文件同步規則
+
+| 觸發事件 | 更新目標 |
+|----------|---------|
+| 實作了新功能 | 對應 wiki 領域頁 |
+| 修了 Bug | wiki 領域頁（Bug 經驗庫段落） |
+| 發現 edge case | wiki 領域頁 + code 中加 WHY NOT 註釋 |
+| 做了決策或否決方案 | `decisions.md` |
+| 以上任何更新 | `wiki/log.md`（append 一條） |
 
 ## 專案結構
 
@@ -37,7 +45,7 @@
 | 檔案 | 修改 |
 |------|------|
 | `pool.rs` | `Arc<Mutex<AcpConnection>>` per-connection lock、per-thread CWD、SharedHandle、session status/kill |
-| `connection.rs` | SharedHandle、PermissionRequest、PendingPermissions、ExitPlanMode auto-approve、auto-allow 從 options 選合法 optionId、OAuth token refresh（Keychain + HTTP）|
+| `connection.rs` | SharedHandle、PermissionRequest、PendingPermissions、ExitPlanMode auto-approve、auto-allow 從 options 選合法 optionId、OAuth token refresh（Docker: HTTP refresh，macOS: 不寫 file 避免破壞 CC CLI）|
 | `protocol.rs` | toolCallId extraction、跳過 sub-tool 事件（parentToolUseId） |
 | `discord.rs` | `[cwd:]`/`[name:]` directives、toolCallId matching、streaming truncation、alive check + hard timeout、drain window + fallback、啟動自動封存舊 thread、gate pipeline loop、steer (try_lock + SharedHandle)、plan mode（CC App 模型：auto-approve + plan review loop）、401 auth retry、spawn_edit_task |
 | `config.rs` | `allowed_bots`、`GatesConfig` |
@@ -63,13 +71,23 @@
 # Bare metal（幕府令）
 RUST_LOG=openab=debug nohup ./target/release/openab config.toml > /tmp/openab.log 2>&1 &
 
-# Docker（幕府行令）
+# Docker（幕府行令）— 需要 CLAUDE_CODE_OAUTH_TOKEN（由 claude setup-token 生成，1 年有效）
 ~/.orbstack/bin/docker restart agent-broker-docker
 
 # 查狀態
 curl -s http://localhost:8090/status   # 幕府令
 curl -s http://localhost:8091/status   # 幕府行令
 ```
+
+## 上游 PR / Issue 撰寫規則
+
+撰寫對上游的 PR 或 Issue 前，**必須先讀 `docs/wiki/upstream.md` 的「PR / Issue 撰寫準則」段落**。
+
+核心要求：
+- 說清楚根因，不只描述症狀
+- 解釋為什麼這是最好的解法，列出替代方案和 tradeoff
+- 附 production 證據（log、數據、重現步驟）
+- 提交前跑一遍自檢流程（5 點 checklist 在 wiki 裡）
 
 ## 注意事項
 

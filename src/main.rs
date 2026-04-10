@@ -57,7 +57,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Arc::new(gate_pipeline))
     };
 
-    let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
+    let state_file = cfg.pool.state_file.as_ref().map(PathBuf::from);
+    let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions, state_file));
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
 
     let allowed_channels: HashSet<u64> = cfg
@@ -74,11 +75,6 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    let start_epoch_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
     let handler = discord::Handler {
         pool: pool.clone(),
         allowed_channels,
@@ -86,7 +82,6 @@ async fn main() -> anyhow::Result<()> {
         reactions_config: cfg.reactions,
         gate_pipeline,
         pending_permissions: Arc::new(acp::PendingPermissions::default()),
-        start_epoch_ms,
     };
 
     let intents = GatewayIntents::GUILD_MESSAGES
@@ -168,9 +163,35 @@ async fn main() -> anyhow::Result<()> {
     // Run bot until SIGINT/SIGTERM
     let shard_manager = client.shard_manager.clone();
     let shutdown_pool = pool.clone();
+    let broadcast_pool = pool.clone();
+    let shutdown_http = client.http.clone();
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
         info!("shutdown signal received");
+
+        // Broadcast shutdown notification to all active threads before closing.
+        let sessions = broadcast_pool.status().await;
+        info!(count = sessions.len(), "broadcasting shutdown notification");
+        for (thread_id, _, _, _) in sessions {
+            if let Ok(id) = thread_id.parse::<u64>() {
+                let channel = serenity::model::id::ChannelId::new(id);
+                if let Err(e) = channel
+                    .say(
+                        &shutdown_http,
+                        "🔄 Broker restarting. You can continue the conversation when the broker is back.",
+                    )
+                    .await
+                {
+                    tracing::warn!(thread_id, error = %e, "failed to post shutdown notification");
+                }
+            }
+        }
+
         shard_manager.shutdown_all().await;
     });
 

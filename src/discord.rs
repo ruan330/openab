@@ -21,7 +21,6 @@ pub struct Handler {
     pub reactions_config: ReactionsConfig,
     pub gate_pipeline: Option<Arc<GatePipeline>>,
     pub pending_permissions: Arc<PendingPermissions>,
-    pub start_epoch_ms: u64,
 }
 
 #[async_trait]
@@ -74,7 +73,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let mut prompt = if is_mentioned {
+        let prompt = if is_mentioned {
             strip_mention(&msg.content)
         } else {
             msg.content.trim().to_string()
@@ -97,14 +96,12 @@ impl EventHandler for Handler {
                 );
 
                 if is_execute {
-                    let _ = msg.channel_id.say(&ctx.http, "▶️ 開始執行").await;
-                    prompt = "The user approved your plan. Start implementing it now. \
-                              Do not re-enter plan mode.".to_string();
+                    let _ = msg.channel_id.say(&ctx.http, "▶️ 已確認").await;
+                    return; // Agent already executing after auto-approve
                 } else {
                     let _ = msg.channel_id.say(&ctx.http, "📝 繼續規劃...").await;
-                    // prompt stays as user's feedback
+                    // prompt stays as user's feedback, fall through to new turn
                 }
-                // Fall through to normal stream_prompt flow
             }
         }
 
@@ -156,18 +153,6 @@ impl EventHandler for Handler {
 
         let thread_channel = ChannelId::new(thread_id);
 
-        // Reject stale threads from before this bot process started
-        if in_thread {
-            let thread_created_ms = (msg.channel_id.get() >> 22) + 1_420_070_400_000;
-            if thread_created_ms < self.start_epoch_ms {
-                info!(thread_id = %msg.channel_id, "rejecting stale thread, archiving");
-                let _ = msg.channel_id.say(&ctx.http, "⚠️ 此 thread 已過期，請重新開一個。").await;
-                let edit = serenity::builder::EditThread::new().archived(true);
-                let _ = msg.channel_id.edit_thread(&ctx.http, edit).await;
-                return;
-            }
-        }
-
         let thinking_msg = match thread_channel.say(&ctx.http, "...").await {
             Ok(m) => m,
             Err(e) => {
@@ -194,13 +179,12 @@ impl EventHandler for Handler {
         ));
         reactions.set_queued().await;
 
-        // Stream prompt with gate pipeline loop
+        // Stream prompt with gate pipeline
         let max_rounds = self.gate_pipeline.as_ref().map(|g| g.max_rounds).unwrap_or(1);
         let mut current_prompt = prompt;
         let mut current_msg = thinking_msg;
         let mut rounds = 0u32;
         let mut final_ok = false;
-        let mut auth_retried = false;
 
         loop {
             rounds += 1;
@@ -218,13 +202,11 @@ impl EventHandler for Handler {
 
             match result {
                 Ok(ref response_text) if response_text == "_(queued)_" => {
-                    // Steered to busy session — no gate evaluation needed
                     final_ok = true;
                     break;
                 }
                 Ok(response_text) => {
                     tracing::debug!(response_len = response_text.len(), has_gate = self.gate_pipeline.is_some(), "gate check");
-                    // Run gate pipeline if configured
                     if let Some(ref pipeline) = self.gate_pipeline {
                         tracing::debug!(is_empty = pipeline.is_empty(), "gate pipeline check");
                         if !pipeline.is_empty() {
@@ -236,7 +218,6 @@ impl EventHandler for Handler {
                                     break;
                                 }
                                 GateResult::Redacted(redacted) => {
-                                    // Re-edit final message with redacted content
                                     let chunks = format::split_message(&redacted, 2000);
                                     let _ = edit(&ctx, thread_channel, current_msg.id, &chunks[0]).await;
                                     final_ok = true;
@@ -277,22 +258,6 @@ impl EventHandler for Handler {
                         break;
                     }
                 }
-                Err(e) if e.to_string().contains("__auth_retry__") && !auth_retried => {
-                    auth_retried = true;
-                    // Auth failed → token refreshed → kill stale session → retry once
-                    tracing::info!(thread_key, "auth retry: killing stale session");
-                    self.pool.kill_session(&thread_key).await;
-                    if let Err(e2) = self.pool.get_or_create(&thread_key, None).await {
-                        let _ = edit(&ctx, thread_channel, current_msg.id, &format!("⚠️ {e2}")).await;
-                        break;
-                    }
-                    let _ = edit(&ctx, thread_channel, current_msg.id, "🔄 _Reconnecting..._").await;
-                    current_msg = match thread_channel.say(&ctx.http, "...").await {
-                        Ok(m) => m,
-                        Err(e2) => { error!("failed to post: {e2}"); break; }
-                    };
-                    continue; // retry the prompt
-                }
                 Err(e) => {
                     let _ = edit(&ctx, thread_channel, current_msg.id, &format!("⚠️ {e}")).await;
                     break;
@@ -300,14 +265,9 @@ impl EventHandler for Handler {
             }
         }
 
-        // If a plan was proposed during stream_prompt, the PendingPermission is
-        // already stored and the plan already displayed. Don't set_done with an
-        // error state — the plan turn completed successfully.
         let has_pending_plan = self.pending_permissions.contains(&thread_key).await;
 
-        if has_pending_plan {
-            reactions.set_done().await;
-        } else if final_ok {
+        if has_pending_plan || final_ok {
             reactions.set_done().await;
         } else {
             reactions.set_error().await;
@@ -327,36 +287,8 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, ctx: Context, ready: Ready) {
+    async fn ready(&self, _ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
-
-        // On startup, archive all active threads in allowed channels.
-        // This prevents stale threads from creating zombie sessions after a restart.
-        let bot_id = ctx.cache.current_user().id;
-        for &channel_id in &self.allowed_channels {
-            let ch = ChannelId::new(channel_id);
-            // Fetch active threads in the guild
-            match ctx.http.get_guild_active_threads(ready.guilds.first().map(|g| g.id).unwrap_or_default()).await {
-                Ok(threads) => {
-                    for thread in threads.threads {
-                        // Only archive threads whose parent is one of our allowed channels
-                        let is_ours = thread.parent_id.map_or(false, |pid| pid.get() == channel_id);
-                        if !is_ours { continue; }
-                        // Only archive threads created by this bot
-                        let is_mine = thread.owner_id.map_or(false, |oid| oid == bot_id);
-                        if !is_mine { continue; }
-
-                        info!(thread_id = %thread.id, name = %thread.name, "archiving stale thread on startup");
-                        let edit = serenity::builder::EditThread::new().archived(true);
-                        let _ = thread.id.edit_thread(&ctx.http, edit).await;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("failed to fetch active threads: {e}");
-                }
-            }
-            let _ = ch; // suppress unused warning
-        }
     }
 }
 
@@ -417,6 +349,9 @@ async fn stream_prompt(
     // Spawn edit-streaming task
     let edit_handle = spawn_edit_task(ctx, channel, msg_id, buf_rx.clone());
 
+    // Track whether plan has been shown this turn (to suppress duplicates)
+    let mut plan_shown = false;
+
     // Process ACP notifications.
     // Periodically check if the agent process is still alive, and enforce a
     // hard timeout as a safety net against infinite tool calls (e.g. flutter run).
@@ -431,28 +366,31 @@ async fn stream_prompt(
             },
             perm = perm_rx.recv() => {
                 if let Some(pr) = perm {
-                    // ExitPlanMode: show plan, auto-approve, let turn end naturally.
-                    // The message handler will pick up the user's response as a new prompt.
-                    if let Some(ref plan) = pr.plan_text {
-                        let plan_msg = format!("📋 **Plan**\n\n{plan}\n\n_回覆「執行」開始執行，或回覆修改意見繼續規劃。_");
-                        let chunks = format::split_message(&plan_msg, 2000);
-                        for chunk in &chunks {
-                            let _ = channel.say(&ctx.http, chunk).await;
-                        }
-                    }
-                    // Auto-approve ExitPlanMode
+                    // Show plan only once per turn (suppress duplicates from
+                    // repeated ExitPlanMode calls in the same turn).
+                    // Reply FIRST — CC has a tight timeout on permission responses.
+                    // Display plan to Discord AFTER replying.
                     if let Some(ref handle) = shared_handle {
                         let _ = handle.send_response(
                             pr.rpc_id,
-                            serde_json::json!({"optionId": "bypassPermissions"}),
+                            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "bypassPermissions"}}),
                         ).await;
                     }
-                    // Store plan so message handler knows a plan was proposed
-                    {
-                        use crate::acp::connection::PendingPermission;
-                        pending_permissions.insert(thread_key.to_string(), PendingPermission {
-                            plan_text: pr.plan_text.unwrap_or_default(),
-                        }).await;
+                    if !plan_shown {
+                        plan_shown = true;
+                        if let Some(ref plan) = pr.plan_text {
+                            let plan_msg = format!("📋 **Plan**\n\n{plan}\n\n_回覆修改意見繼續規劃，或等待執行完成。_");
+                            let chunks = format::split_message(&plan_msg, 2000);
+                            for chunk in &chunks {
+                                let _ = channel.say(&ctx.http, chunk).await;
+                            }
+                        }
+                        {
+                            use crate::acp::connection::PendingPermission;
+                            pending_permissions.insert(thread_key.to_string(), PendingPermission {
+                                plan_text: pr.plan_text.unwrap_or_default(),
+                            }).await;
+                        }
                     }
                 }
                 continue;
@@ -471,18 +409,6 @@ async fn stream_prompt(
         };
 
         if notification.id.is_some() {
-            // Check for auth errors — trigger token refresh for retry
-            if let Some(ref err) = notification.error {
-                if err.message.contains("401") || err.message.contains("authentication") {
-                    tracing::warn!("auth error detected, refreshing OAuth token");
-                    crate::acp::connection::refresh_oauth_if_needed().await;
-                    conn.prompt_done().await;
-                    drop(conn);
-                    drop(buf_tx);
-                    let _ = edit_handle.await;
-                    return Err(anyhow::anyhow!("__auth_retry__"));
-                }
-            }
             // Prompt response arrived. Drain any remaining notifications
             // for a short window — message chunks sometimes arrive after
             // the response due to ACP event ordering.

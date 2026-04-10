@@ -34,6 +34,12 @@ pub struct AgentConfig {
     pub working_dir: String,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Model for agent sessions (e.g. "opus", "sonnet", "claude-opus-4-6").
+    /// Prepended as `--model <value>` to args when set.
+    pub model: Option<String>,
+    /// Permission mode (e.g. "plan", "auto", "bypassPermissions").
+    /// Prepended as `--permission-mode <value>` to args when set.
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +48,10 @@ pub struct PoolConfig {
     pub max_sessions: usize,
     #[serde(default = "default_ttl_hours")]
     pub session_ttl_hours: u64,
+    /// Optional path to persist per-thread cwd mappings across broker restarts.
+    /// None (default) = no persistence.
+    #[serde(default)]
+    pub state_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,7 +183,11 @@ fn default_error_hold_ms() -> u64 { 2_500 }
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        Self { max_sessions: default_max_sessions(), session_ttl_hours: default_ttl_hours() }
+        Self {
+            max_sessions: default_max_sessions(),
+            session_ttl_hours: default_ttl_hours(),
+            state_file: None,
+        }
     }
 }
 

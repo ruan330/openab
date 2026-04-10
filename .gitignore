@@ -3,3 +3,5 @@ config.toml
 config-docker.toml
 *.swp
 .DS_Store
+/state/
+/.claude/
