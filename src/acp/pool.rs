@@ -1,7 +1,8 @@
 use crate::acp::connection::AcpConnection;
 use crate::acp::protocol::ConfigOption;
+use crate::adapter::{ChannelRef, ChatAdapter};
 use crate::config::AgentConfig;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -16,6 +17,11 @@ struct PoolState {
     /// Lock-free cancel handles: thread_key → (stdin, session_id).
     /// Stored separately so cancel can work without locking the connection.
     cancel_handles: HashMap<String, (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String)>,
+    /// Addressing info for each active thread. Populated alongside `active`
+    /// and pruned together. Used by `begin_shutdown` so the broker can post
+    /// a notification to every live session without the adapter layer
+    /// maintaining a parallel cache. Invariant: `addresses.keys() == active.keys()`.
+    addresses: HashMap<String, (ChannelRef, Arc<dyn ChatAdapter>)>,
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Saved on eviction so sessions can be resumed via `session/load`.
     suspended: HashMap<String, String>,
@@ -28,6 +34,10 @@ pub struct SessionPool {
     state: RwLock<PoolState>,
     config: AgentConfig,
     max_sessions: usize,
+    /// Flipped by `begin_shutdown` to reject new admissions. Checked inside
+    /// `get_or_create` under the state write lock so admission and snapshot
+    /// are atomic.
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 type EvictionCandidate = (
@@ -67,15 +77,53 @@ impl SessionPool {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
                 cancel_handles: HashMap::new(),
+                addresses: HashMap::new(),
                 suspended: HashMap::new(),
                 creating: HashMap::new(),
             }),
             config,
             max_sessions,
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    pub async fn get_or_create(&self, thread_id: &str) -> Result<()> {
+    /// True once `begin_shutdown` has been called. Router uses this to show a
+    /// shutdown-specific message instead of a generic pool error when
+    /// `get_or_create` rejects admission.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Flip the pool into shutting-down state and return a snapshot of every
+    /// live session's addressing info. Takes the state write lock so the
+    /// snapshot is atomic with respect to in-flight `get_or_create` calls:
+    /// any admission that committed before us is included; any that comes
+    /// after us sees the flag inside the same lock and rejects.
+    pub async fn begin_shutdown(&self) -> Vec<(String, ChannelRef, Arc<dyn ChatAdapter>)> {
+        let state = self.state.write().await;
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+        state
+            .addresses
+            .iter()
+            .map(|(k, (c, a))| (k.clone(), c.clone(), a.clone()))
+            .collect()
+    }
+
+    pub async fn get_or_create(
+        &self,
+        thread_id: &str,
+        channel: &ChannelRef,
+        adapter: &Arc<dyn ChatAdapter>,
+    ) -> Result<()> {
+        // Fast-fail: avoid spawning a fresh ACP process if shutdown is already
+        // in progress. The authoritative check happens again under the state
+        // write lock below so we also catch shutdowns that start mid-spawn.
+        if self.is_shutting_down() {
+            bail!("pool is shutting down");
+        }
+
         let create_gate = {
             let mut state = self.state.write().await;
             get_or_insert_gate(&mut state.creating, thread_id)
@@ -84,6 +132,9 @@ impl SessionPool {
 
         let (existing, saved_session_id) = {
             let state = self.state.read().await;
+            if self.is_shutting_down() {
+                bail!("pool is shutting down");
+            }
             (
                 state.active.get(thread_id).cloned(),
                 state.suspended.get(thread_id).cloned(),
@@ -95,6 +146,16 @@ impl SessionPool {
         if let Some(conn) = existing.clone() {
             let conn = conn.lock().await;
             if conn.alive() {
+                // Re-check shutdown state after waiting on the per-connection
+                // mutex. Taking `state.read()` synchronizes us with
+                // `begin_shutdown`'s write-lock flag flip, so the flag value
+                // we see here reflects every `begin_shutdown` that has
+                // committed. This closes the race where shutdown starts
+                // while we were waiting on `conn.lock()`.
+                let _sync = self.state.read().await;
+                if self.is_shutting_down() {
+                    bail!("pool is shutting down");
+                }
                 return Ok(());
             }
             if saved_session_id.is_none() {
@@ -174,6 +235,14 @@ impl SessionPool {
 
         let mut state = self.state.write().await;
 
+        // Admission check inside the state write lock. This is atomic with
+        // `begin_shutdown`'s flag-flip + snapshot: a shutdown that started
+        // during our ACP spawn is caught here, and our work is thrown away
+        // rather than being added to a pool that is about to be torn down.
+        if self.is_shutting_down() {
+            bail!("pool is shutting down");
+        }
+
         // Another task may have created a healthy connection while we were
         // initializing this one.
         if let Some(existing) = state.active.get(thread_id).cloned() {
@@ -186,11 +255,13 @@ impl SessionPool {
             warn!(thread_id, "stale connection, rebuilding");
             drop(existing);
             state.active.remove(thread_id);
+            state.addresses.remove(thread_id);
         }
 
         if state.active.len() >= self.max_sessions {
             if let Some((key, expected_conn, _, sid)) = eviction_candidate {
                 if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
+                    state.addresses.remove(&key);
                     info!(evicted = %key, "pool full, suspending oldest idle session");
                     if let Some(sid) = sid {
                         state.suspended.insert(key, sid);
@@ -216,6 +287,9 @@ impl SessionPool {
         if !cancel_session_id.is_empty() {
             state.cancel_handles.insert(thread_id.to_string(), (cancel_handle, cancel_session_id));
         }
+        state
+            .addresses
+            .insert(thread_id.to_string(), (channel.clone(), adapter.clone()));
         Ok(())
     }
 
@@ -324,6 +398,7 @@ impl SessionPool {
         let mut state = self.state.write().await;
         for (key, expected_conn, sid) in stale {
             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
+                state.addresses.remove(&key);
                 info!(thread_id = %key, "cleaning up idle session");
                 if let Some(sid) = sid {
                     state.suspended.insert(key, sid);
@@ -336,6 +411,7 @@ impl SessionPool {
         let mut state = self.state.write().await;
         let count = state.active.len();
         state.active.clear(); // Drop impl kills process groups
+        state.addresses.clear();
         info!(count, "pool shutdown complete");
     }
 }
