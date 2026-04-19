@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -32,7 +32,7 @@ pub struct MessageRef {
 }
 
 /// Sender identity injected into prompts for downstream agent context.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SenderContext {
     pub schema: String,
     pub sender_id: String,
@@ -116,7 +116,6 @@ impl AdapterRouter {
         adapter: &Arc<dyn ChatAdapter>,
         thread_channel: &ChannelRef,
         sender_json: &str,
-        sender_is_bot: bool,
         prompt: &str,
         extra_blocks: Vec<ContentBlock>,
         trigger_msg: &MessageRef,
@@ -167,6 +166,9 @@ impl AdapterRouter {
                 // new bot event, route it here during the shutdown window, and
                 // we'd reply with another bot-authored rejection — looping until
                 // the bot-turn cap trips. Human senders still get the notice.
+                let sender_is_bot = serde_json::from_str::<SenderContext>(sender_json)
+                    .map(|sender| sender.is_bot)
+                    .unwrap_or(false);
                 if !sender_is_bot {
                     let _ = adapter
                         .send_message(

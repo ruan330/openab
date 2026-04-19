@@ -521,7 +521,6 @@ impl EventHandler for Handler {
                     &adapter,
                     &thread_channel,
                     &sender_json,
-                    sender.is_bot,
                     &prompt,
                     extra_blocks,
                     &trigger_msg,
