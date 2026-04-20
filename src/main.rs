@@ -259,11 +259,17 @@ async fn main() -> anyhow::Result<()> {
 /// we fall back to ctrl_c alone.
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() {
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("install SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        Err(e) => {
+            warn!("failed to install SIGTERM handler ({e}), falling back to ctrl_c only");
+            tokio::signal::ctrl_c().await.ok();
+        }
     }
     info!("shutdown signal received");
 }
